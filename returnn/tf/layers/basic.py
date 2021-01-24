@@ -1649,6 +1649,8 @@ class SoftmaxOverSpatialLayer(_ConcatInputLayer):
     self.output_before_activation = OutputWithActivation(
       energy, act_func=tf.nn.log_softmax if log_space else tf.nn.softmax)  # (...,T)
     self.output.placeholder = self.output_before_activation.y
+    # Never allow inf in output, as softmax should remove all -inf values used for masking
+    self.allow_inf_in_output = False
 
   def get_dep_layers(self):
     """
@@ -1721,6 +1723,7 @@ class SeqLenMaskLayer(_ConcatInputLayer):
   """
   Masks some values away given the seq_len_source with mask_value.
   Also see :class:`SoftmaxOverSpatialLayer`.
+  Also see :class:`SwitchLayer`, which can be used to apply a generic mask.
   """
   layer_class = "seq_len_mask"
 
@@ -2134,23 +2137,7 @@ class ConstantLayer(LayerBase):
     :param bool with_batch_dim:
     :rtype: Data
     """
-    import numpy
-    if dtype is None:
-      if isinstance(value, int):
-        dtype = "int32"
-      elif isinstance(value, float):
-        dtype = "float32"
-      elif isinstance(value, bool):
-        dtype = "bool"
-      elif isinstance(value, numpy.ndarray):
-        dtype = str(value.dtype)
-      else:
-        raise TypeError("cannot handle value %r of type %r" % (value, type(value)))
-    shape = value.shape if isinstance(value, numpy.ndarray) else ()
-    return Data(
-      name="%s_const" % name,
-      shape=shape, batch_dim_axis=0 if with_batch_dim else None, time_dim_axis=None,
-      dtype=dtype)
+    return Data.template_from_constant(value, name="%s_const" % name, dtype=dtype, with_batch_dim=with_batch_dim)
 
 
 class GatingLayer(_ConcatInputLayer):
@@ -6079,15 +6066,22 @@ class SwitchLayer(LayerBase):
   Wrapper around ``tf.where()`` (or more generically :func:`TFUtil.where_bc`),
   or statically choose a single source if the condition is a callable (...)->bool.
   (``tf.cond`` is not useful here, as the sources would have been already constructed and computed.)
+
+  This layer is also useful for applying any kind of generic masking to the frames.
+  E.g. one could have a layer called "mask" computing a boolean mask for the values stored in another layer "input".
+  Then use this layer with condition="mask", true_from="input", false_from=mask_value,
+  to mask out all frames where the mask is false with the mask_value.
+
   See also :class:`CondLayer`.
+  See also :class:`SeqLenMaskLayer` if you just want to mask using the sequence lengths.
   """
   layer_class = "switch"
 
   def __init__(self, condition, true_from, false_from, **kwargs):
     """
     :param LayerBase|bool condition: if callable, expected to be (...)->bool, and called in transform_config_dict
-    :param LayerBase|None true_from:
-    :param LayerBase|None false_from:
+    :param LayerBase|float|int|None true_from:
+    :param LayerBase|float|int|None false_from:
     """
     from returnn.tf.util.basic import where_bc
     super(SwitchLayer, self).__init__(**kwargs)
@@ -6097,16 +6091,61 @@ class SwitchLayer(LayerBase):
     self.false_from = false_from
     if isinstance(condition, bool):
       if condition:
-        self.output = true_from.output.copy("%s_output" % self.name)
+        true_data = true_from.output if isinstance(true_from, LayerBase) else Data.from_tensor(tf.identity(true_from))
+        self.output = true_data.copy("%s_output" % self.name)
+        if self._get_source_allow_inf_in_output(true_from):
+            self.allow_inf_in_output = True
       else:
-        self.output = false_from.output.copy("%s_output" % self.name)
+        false_data = false_from.output if isinstance(false_from, LayerBase) else Data.from_tensor(
+          tf.identity(false_from))
+        self.output = false_data.copy("%s_output" % self.name)
+        if self._get_source_allow_inf_in_output(false_from):
+            self.allow_inf_in_output = True
     else:
       assert isinstance(condition, LayerBase)
       assert condition.output.dtype == "bool"
+      true_data = true_from.output if isinstance(true_from, LayerBase) else Data.from_tensor(tf.identity(true_from))
+      false_data = false_from.output if isinstance(false_from, LayerBase) else Data.from_tensor(tf.identity(false_from))
       self.output.placeholder = where_bc(
         condition=condition.output.copy_compatible_to(self.output, check_dtype=False, check_sparse=False).placeholder,
-        x=true_from.output.copy_compatible_to(self.output).placeholder,
-        y=false_from.output.copy_compatible_to(self.output).placeholder)
+        x=true_data.copy_compatible_to(self.output).placeholder,
+        y=false_data.copy_compatible_to(self.output).placeholder)
+      if self._get_source_allow_inf_in_output(true_from) or self._get_source_allow_inf_in_output(false_from):
+        self.allow_inf_in_output = True
+
+  @classmethod
+  def _transform_source_name(cls, source_name, get_layer):
+    """
+    :param str source_name:
+    :param ((str) -> LayerBase) get_layer: function to get or construct another layer
+    :return: how the input layer should appear in the transformed config dict
+    :rtype: LayerBase|float|int
+    """
+    if isinstance(source_name, str):
+      return get_layer(source_name)
+    return source_name
+
+  @classmethod
+  def _get_source_template(cls, source, name):
+    """
+    :param LayerBase|float|int source:
+    :param str name:
+    :rtype: Data
+    """
+    if isinstance(source, LayerBase):
+      return source.output.copy(name)
+    return Data.template_from_constant(source, name=name)
+
+  @classmethod
+  def _get_source_allow_inf_in_output(cls, source):
+    """
+    :param LayerBase|float|int source:
+    :rtype: bool
+    """
+    if isinstance(source, LayerBase):
+      return source.allow_inf_in_output
+    else:
+      return source in (float('inf'), float('-inf'))
 
   @classmethod
   def transform_config_dict(cls, d, network, get_layer):
@@ -6123,35 +6162,38 @@ class SwitchLayer(LayerBase):
       condition = d["condition"](**kwargs)
       assert isinstance(condition, bool)
       if condition:
-        d.update(dict(condition=True, true_from=get_layer(d["true_from"]), false_from=None))
+        true_from = cls._transform_source_name(d["true_from"], get_layer=get_layer)
+        d.update(dict(condition=True, true_from=true_from, false_from=None))
       else:
-        d.update(dict(condition=False, true_from=None, false_from=get_layer(d["false_from"])))
+        false_from = cls._transform_source_name(d["false_from"], get_layer=get_layer)
+        d.update(dict(condition=False, true_from=None, false_from=false_from))
     else:
       d["condition"] = get_layer(d["condition"])
-      d["true_from"] = get_layer(d["true_from"])
-      d["false_from"] = get_layer(d["false_from"])
+      d["true_from"] = cls._transform_source_name(d["true_from"], get_layer=get_layer)
+      d["false_from"] = cls._transform_source_name(d["false_from"], get_layer=get_layer)
 
   @classmethod
   def get_out_data_from_opts(cls, name, condition, true_from, false_from, **kwargs):
     """
     :param str name:
     :param LayerBase|bool condition:
-    :param LayerBase|None true_from:
-    :param LayerBase|None false_from:
+    :param LayerBase|float|int|None true_from:
+    :param LayerBase|float|int|None false_from:
     :rtype: Data
     """
     if isinstance(condition, bool):
       if condition:
-        return true_from.output.copy("%s_output" % name)
+        return cls._get_source_template(true_from, name="%s_output" % name)
       else:
-        return false_from.output.copy("%s_output" % name)
-    out = Data.get_common_data([true_from.output, false_from.output, condition.output])
-    out = out.copy(name="%s_output" % name)
-    out.dtype = true_from.output.dtype
-    out.sparse = true_from.output.sparse
-    out.dim = true_from.output.dim
-    out.vocab = true_from.output.vocab
-    return out
+        return cls._get_source_template(false_from, name="%s_output" % name)
+    true_data = cls._get_source_template(true_from, name="%s_true" % name)
+    false_data = cls._get_source_template(false_from, name="%s_false" % name)
+    out = Data.get_common_data([true_data, false_data, condition.output])
+    out.dtype = true_data.dtype
+    out.sparse = true_data.sparse
+    out.dim = true_data.dim
+    out.vocab = true_data.vocab
+    return out.copy(name="%s_output" % name)
 
   def get_dep_layers(self):
     """
